@@ -267,13 +267,14 @@ app.prepare().then(async () => {
       console.log(`[Room ${roomId}] ${currentUser.name} (${currentUser.role}) joined via socket ${socket.id}`);
     });
 
-    // WebRTC Signaling routing
-    socket.on('signal', ({ targetPeerId, signal, streamType }) => {
+    // WebRTC Signaling routing with in-band track metadata
+    socket.on('signal', ({ targetPeerId, signal, streamType, trackMeta }) => {
       io.to(targetPeerId).emit('signal', {
         senderPeerId: socket.id,
         senderRole: currentUser?.role || 'senior-doctor',
         signal,
         streamType,
+        trackMeta,
       });
     });
 

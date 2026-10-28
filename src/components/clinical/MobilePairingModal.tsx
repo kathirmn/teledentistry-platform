@@ -25,7 +25,15 @@ export function MobilePairingModal({
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copied, setCopied] = useState(false);
 
-  // If localIp is localhost, fallback to window.location.hostname
+  // Detect whether running on a deployed public cloud domain (e.g. *.onrender.com)
+  const isPublicHost =
+    typeof window !== 'undefined' &&
+    window.location.hostname !== 'localhost' &&
+    window.location.hostname !== '127.0.0.1' &&
+    !/^192\.168\./.test(window.location.hostname) &&
+    !/^10\./.test(window.location.hostname) &&
+    !/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(window.location.hostname);
+
   const effectiveIp =
     localIp && localIp !== 'localhost'
       ? localIp
@@ -33,8 +41,17 @@ export function MobilePairingModal({
       ? window.location.hostname
       : '192.168.0.6';
 
-  const port = protocolMode === 'https' ? httpsPort : httpPort;
-  const mobileUrl = `${protocolMode}://${effectiveIp}:${port}/room/${roomId}/mobile`;
+  // If cloud deployed or already served on public HTTPS, use standard origin (port 443)
+  // Otherwise use local LAN IP with configured test ports
+  let mobileUrl = '';
+  if (typeof window !== 'undefined') {
+    if (isPublicHost || window.location.protocol === 'https:') {
+      mobileUrl = `${window.location.origin}/room/${roomId}/mobile`;
+    } else {
+      const port = protocolMode === 'https' ? httpsPort : httpPort;
+      mobileUrl = `${protocolMode}://${effectiveIp}:${port}/room/${roomId}/mobile`;
+    }
+  }
 
   useEffect(() => {
     if (isOpen) {
@@ -79,32 +96,42 @@ export function MobilePairingModal({
           </div>
         </div>
 
-        {/* Protocol Selector Tabs */}
-        <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 mb-4 text-xs font-semibold">
-          <button
-            onClick={() => setProtocolMode('https')}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg transition ${
-              protocolMode === 'https'
-                ? 'bg-cyan-600 text-white shadow'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Lock className="w-3.5 h-3.5" />
-            <span>HTTPS (Port {httpsPort})</span>
-            <span className="text-[9px] bg-cyan-900 text-cyan-200 px-1 rounded">Recommended</span>
-          </button>
-          <button
-            onClick={() => setProtocolMode('http')}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg transition ${
-              protocolMode === 'http'
-                ? 'bg-cyan-600 text-white shadow'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Globe className="w-3.5 h-3.5" />
-            <span>HTTP (Port {httpPort})</span>
-          </button>
-        </div>
+        {/* Cloud Deployed Notice or LAN Protocol Selector Tabs */}
+        {isPublicHost || (typeof window !== 'undefined' && window.location.protocol === 'https:') ? (
+          <div className="flex items-center gap-2 bg-emerald-950/40 border border-emerald-800/60 p-2.5 rounded-xl mb-4 text-xs text-emerald-200">
+            <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+            <div>
+              <span className="font-semibold text-emerald-300">Public Cloud Deployed: </span>
+              Works across any cellular (4G/5G) or outside Wi-Fi network.
+            </div>
+          </div>
+        ) : (
+          <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 mb-4 text-xs font-semibold">
+            <button
+              onClick={() => setProtocolMode('https')}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg transition ${
+                protocolMode === 'https'
+                  ? 'bg-cyan-600 text-white shadow'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span>HTTPS (Port {httpsPort})</span>
+              <span className="text-[9px] bg-cyan-900 text-cyan-200 px-1 rounded">Recommended</span>
+            </button>
+            <button
+              onClick={() => setProtocolMode('http')}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg transition ${
+                protocolMode === 'http'
+                  ? 'bg-cyan-600 text-white shadow'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Globe className="w-3.5 h-3.5" />
+              <span>HTTP (Port {httpPort})</span>
+            </button>
+          </div>
+        )}
 
         {/* QR Code Container */}
         <div className="flex flex-col items-center justify-center bg-white p-4 rounded-xl shadow-inner mb-4">
@@ -124,7 +151,11 @@ export function MobilePairingModal({
             <ShieldCheck className="w-4 h-4" />
             <span>Camera Access on Mobile Phone:</span>
           </div>
-          {protocolMode === 'https' ? (
+          {isPublicHost || (typeof window !== 'undefined' && window.location.protocol === 'https:') ? (
+            <p className="text-[11px] text-slate-300 leading-relaxed">
+              Scan with your phone camera, tap to open the link, and grant camera permissions when prompted. Your companion stream will instantly appear on the dashboard!
+            </p>
+          ) : protocolMode === 'https' ? (
             <p className="text-[11px] text-slate-300 leading-relaxed">
               When your phone loads the page, tap <strong>&ldquo;Advanced&rdquo;</strong> &rarr;{' '}
               <strong>&ldquo;Proceed to {effectiveIp} (unsafe)&rdquo;</strong>, then grant camera permissions. Both

@@ -64,8 +64,14 @@ export function useWebRTC({
   const iceCandidatesQueue = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
 
   // W3C Perfect Negotiation & Track Identification state
-  const senderFeedMap = useRef<Map<string, Map<RTCRtpSender, VideoFeedType | 'audio'>>>(new Map());
+  interface PeerSenders {
+    audio?: RTCRtpSender | null;
+    intraoral?: RTCRtpSender | null;
+    webcam?: RTCRtpSender | null;
+  }
+  const peerSendersRef = useRef<Map<string, PeerSenders>>(new Map());
   const trackMetadataRef = useRef<Map<string, VideoFeedType>>(new Map());
+  const streamMetadataRef = useRef<Map<string, VideoFeedType>>(new Map());
   const makingOfferRef = useRef<Map<string, boolean>>(new Map());
   const [iceConnectionState, setIceConnectionState] = useState<RTCIceConnectionState>('new');
 
@@ -148,7 +154,7 @@ export function useWebRTC({
       }
       iceCandidatesQueue.current.delete(socketId);
       peerRolesRef.current.delete(socketId);
-      senderFeedMap.current.delete(socketId);
+      peerSendersRef.current.delete(socketId);
       makingOfferRef.current.delete(socketId);
       const existingAudioEl = document.getElementById(`audio-peer-${socketId}`);
       if (existingAudioEl) existingAudioEl.remove();
@@ -162,19 +168,22 @@ export function useWebRTC({
     });
 
     // Deterministic WebRTC track-to-feed mapping
-    s.on('track-metadata', ({ senderPeerId, tracks }: { senderPeerId: string; tracks: Array<{ trackId: string; feedType: VideoFeedType }> }) => {
+    s.on('track-metadata', ({ senderPeerId, tracks }: { senderPeerId: string; tracks: Array<{ trackId: string; streamId?: string; feedType: VideoFeedType }> }) => {
       if (Array.isArray(tracks)) {
-        tracks.forEach(({ trackId, feedType }) => {
-          trackMetadataRef.current.set(trackId, feedType);
-          console.log(`[WebRTC TrackMeta] Mapped track ${trackId} -> ${feedType} from ${senderPeerId}`);
+        tracks.forEach(({ trackId, streamId, feedType }) => {
+          if (trackId) trackMetadataRef.current.set(trackId, feedType);
+          if (streamId) streamMetadataRef.current.set(streamId, feedType);
+          console.log(`[WebRTC TrackMeta] Mapped track ${trackId} (stream: ${streamId}) -> ${feedType} from ${senderPeerId}`);
 
           // Update any already-attached remote feeds
           setRemoteFeeds((prev) => {
             const next = new Map(prev);
             let updated = false;
             for (const [key, val] of next.entries()) {
-              if (val.peerId === senderPeerId && val.stream.getVideoTracks().some((t) => t.id === trackId)) {
-                if (val.feedType !== feedType) {
+              if (val.peerId === senderPeerId) {
+                const matchesTrack = trackId && val.stream.getVideoTracks().some((t) => t.id === trackId);
+                const matchesStream = streamId && val.stream.id === streamId;
+                if ((matchesTrack || matchesStream) && val.feedType !== feedType) {
                   next.delete(key);
                   next.set(`${senderPeerId}-${feedType}`, { stream: val.stream, feedType, peerId: senderPeerId });
                   updated = true;
@@ -307,30 +316,66 @@ export function useWebRTC({
     [role, socket]
   );
 
+  // Helper to extract deterministic metadata for all active local video tracks
+  const getLocalTrackMeta = useCallback(() => {
+    const meta: Array<{ trackId: string; streamId?: string; feedType: VideoFeedType }> = [];
+    if (role === 'junior-dentist') {
+      if (intraoralStream) {
+        const intraTrack = intraoralStream.getVideoTracks()[0];
+        if (intraTrack) {
+          meta.push({
+            trackId: intraTrack.id,
+            streamId: intraoralStream.id,
+            feedType: 'intraoral',
+          });
+        }
+      }
+      if (webcamStream) {
+        const webTrack = webcamStream.getVideoTracks()[0];
+        if (webTrack) {
+          meta.push({
+            trackId: webTrack.id,
+            streamId: webcamStream.id,
+            feedType: 'webcam',
+          });
+        }
+      }
+    } else if (role === 'senior-doctor') {
+      if (webcamStream) {
+        const webTrack = webcamStream.getVideoTracks()[0];
+        if (webTrack) {
+          meta.push({
+            trackId: webTrack.id,
+            streamId: webcamStream.id,
+            feedType: 'senior-cam',
+          });
+        }
+      }
+    }
+    return meta;
+  }, [role, intraoralStream, webcamStream]);
+
   // Synchronize local audio and video tracks onto a peer connection
   const syncLocalTracksToPc = useCallback(
     (targetPeerId: string, pc: RTCPeerConnection) => {
       const targetRole = peerRolesRef.current.get(targetPeerId);
       if (targetRole === 'mobile-cam') return; // Mobile is receive-only
 
-      if (!senderFeedMap.current.has(targetPeerId)) {
-        senderFeedMap.current.set(targetPeerId, new Map());
+      if (!peerSendersRef.current.has(targetPeerId)) {
+        peerSendersRef.current.set(targetPeerId, {});
       }
-      const peerSenderMap = senderFeedMap.current.get(targetPeerId)!;
-      const senders = pc.getSenders();
-      const trackMeta: Array<{ trackId: string; feedType: VideoFeedType }> = [];
+      const senders = peerSendersRef.current.get(targetPeerId)!;
+      const pcSenders = pc.getSenders();
 
       // 1. Audio track synchronization
       if (audioStream) {
         const audioTrack = audioStream.getAudioTracks()[0];
         if (audioTrack) {
-          let audioSender = senders.find((s) => s.track?.kind === 'audio' || peerSenderMap.get(s) === 'audio');
-          if (audioSender) {
-            audioSender.replaceTrack(audioTrack).catch(console.warn);
+          if (senders.audio && pcSenders.includes(senders.audio)) {
+            senders.audio.replaceTrack(audioTrack).catch(console.warn);
           } else {
             try {
-              audioSender = pc.addTrack(audioTrack, audioStream);
-              peerSenderMap.set(audioSender, 'audio');
+              senders.audio = pc.addTrack(audioTrack, audioStream);
             } catch (e) {
               console.warn('[WebRTC] Error adding audio track:', e);
             }
@@ -339,21 +384,23 @@ export function useWebRTC({
       }
 
       // 2. Intraoral camera track synchronization (Junior Dentist only)
-      if (role === 'junior-dentist' && intraoralStream) {
-        const intraTrack = intraoralStream.getVideoTracks()[0];
-        if (intraTrack) {
-          trackMeta.push({ trackId: intraTrack.id, feedType: 'intraoral' });
-          let intraSender = senders.find((s) => peerSenderMap.get(s) === 'intraoral');
-          if (intraSender) {
-            intraSender.replaceTrack(intraTrack).catch(console.warn);
-          } else {
-            try {
-              intraSender = pc.addTrack(intraTrack, intraoralStream);
-              peerSenderMap.set(intraSender, 'intraoral');
-            } catch (e) {
-              console.warn('[WebRTC] Error adding intraoral track:', e);
+      if (role === 'junior-dentist') {
+        if (intraoralStream) {
+          const intraTrack = intraoralStream.getVideoTracks()[0];
+          if (intraTrack) {
+            if (senders.intraoral && pcSenders.includes(senders.intraoral)) {
+              senders.intraoral.replaceTrack(intraTrack).catch(console.warn);
+            } else {
+              try {
+                senders.intraoral = pc.addTrack(intraTrack, intraoralStream);
+              } catch (e) {
+                console.warn('[WebRTC] Error adding intraoral track:', e);
+              }
             }
           }
+        } else if (senders.intraoral && pcSenders.includes(senders.intraoral)) {
+          // Camera disconnected/ended - replace with null to deactivate on remote peer
+          senders.intraoral.replaceTrack(null).catch(console.warn);
         }
       }
 
@@ -361,28 +408,27 @@ export function useWebRTC({
       if (webcamStream) {
         const webTrack = webcamStream.getVideoTracks()[0];
         if (webTrack) {
-          const feedType: VideoFeedType = role === 'junior-dentist' ? 'webcam' : 'senior-cam';
-          trackMeta.push({ trackId: webTrack.id, feedType });
-          let webSender = senders.find((s) => peerSenderMap.get(s) === feedType);
-          if (webSender) {
-            webSender.replaceTrack(webTrack).catch(console.warn);
+          if (senders.webcam && pcSenders.includes(senders.webcam)) {
+            senders.webcam.replaceTrack(webTrack).catch(console.warn);
           } else {
             try {
-              webSender = pc.addTrack(webTrack, webcamStream);
-              peerSenderMap.set(webSender, feedType);
+              senders.webcam = pc.addTrack(webTrack, webcamStream);
             } catch (e) {
               console.warn('[WebRTC] Error adding webcam track:', e);
             }
           }
         }
+      } else if (senders.webcam && pcSenders.includes(senders.webcam)) {
+        senders.webcam.replaceTrack(null).catch(console.warn);
       }
 
       // 4. Broadcast track metadata to target peer so receiver maps tracks deterministically
+      const trackMeta = getLocalTrackMeta();
       if (trackMeta.length > 0 && socket) {
         socket.emit('track-metadata', { targetPeerId, tracks: trackMeta });
       }
     },
-    [role, audioStream, intraoralStream, webcamStream, socket]
+    [role, audioStream, intraoralStream, webcamStream, socket, getLocalTrackMeta]
   );
 
   // Whenever local media streams become available or change, sync to all existing peer connections!
@@ -429,15 +475,17 @@ export function useWebRTC({
         pc.onnegotiationneeded = async () => {
           try {
             makingOfferRef.current.set(targetPeerId, true);
+            syncLocalTracksToPc(targetPeerId, pc);
             const offer = await pc.createOffer();
             if (pc.signalingState !== 'stable') return;
             await pc.setLocalDescription(offer);
+            const trackMeta = getLocalTrackMeta();
             socket?.emit('signal', {
               targetPeerId,
               signal: offer,
+              trackMeta,
             });
-            syncLocalTracksToPc(targetPeerId, pc);
-            console.log(`[WebRTC] Sent renegotiation offer to ${targetPeerId}`);
+            console.log(`[WebRTC] Sent renegotiation offer with ${trackMeta.length} track metadata to ${targetPeerId}`);
           } catch (err) {
             console.warn(`[WebRTC] Negotiation error with ${targetPeerId}:`, err);
           } finally {
@@ -505,15 +553,34 @@ export function useWebRTC({
         }
 
         if (track.kind === 'video') {
-          // Identify feedType deterministically via trackMetadataRef
-          let feedType: VideoFeedType;
-          if (trackMetadataRef.current.has(track.id)) {
-            feedType = trackMetadataRef.current.get(track.id)!;
-          } else {
+          // Identify feedType deterministically via trackMetadataRef or streamMetadataRef
+          let feedType: VideoFeedType | undefined =
+            trackMetadataRef.current.get(track.id) ||
+            (incomingStream && streamMetadataRef.current.get(incomingStream.id));
+
+          if (!feedType) {
             const peerRole = peerRolesRef.current.get(targetPeerId);
-            if (peerRole === 'senior-doctor') feedType = 'senior-cam';
-            else if (peerRole === 'mobile-cam') feedType = 'mobile';
-            else feedType = 'intraoral';
+            if (peerRole === 'senior-doctor') {
+              feedType = 'senior-cam';
+            } else if (peerRole === 'mobile-cam') {
+              feedType = 'mobile';
+            } else {
+              // Junior dentist sends up to 2 video feeds: intraoral & webcam.
+              // Check what feeds we already have from this peer so we never overwrite!
+              const existing = Array.from(remoteFeeds.values()).filter((f) => f.peerId === targetPeerId);
+              const hasIntra = existing.some((f) => f.feedType === 'intraoral');
+              const hasWeb = existing.some((f) => f.feedType === 'webcam');
+
+              if (!hasIntra && !hasWeb) {
+                // First video track from junior dentist:
+                // If junior dentist only has 1 camera, it's typically their face webcam
+                feedType = 'webcam';
+              } else if (hasIntra && !hasWeb) {
+                feedType = 'webcam';
+              } else {
+                feedType = 'intraoral';
+              }
+            }
           }
 
           console.log(`[WebRTC ontrack] Incoming video track ${track.id} from ${targetPeerId} mapped to feedType: ${feedType}`);
@@ -522,15 +589,25 @@ export function useWebRTC({
 
           setRemoteFeeds((prev) => {
             const next = new Map(prev);
-            next.set(feedKey, { stream: finalStream, feedType, peerId: targetPeerId });
+            next.set(feedKey, { stream: finalStream, feedType: feedType!, peerId: targetPeerId });
             return next;
           });
+
+          // Handle track ending / deactivation cleanly
+          track.onended = () => {
+            console.log(`[WebRTC ontrack] Remote track ${track.id} (${feedType}) ended`);
+            setRemoteFeeds((prev) => {
+              const next = new Map(prev);
+              next.delete(feedKey);
+              return next;
+            });
+          };
         }
       };
 
       return pc;
     },
-    [socket, syncLocalTracksToPc]
+    [socket, syncLocalTracksToPc, getLocalTrackMeta, remoteFeeds]
   );
 
   const setupDataChannel = (dc: RTCDataChannel) => {
@@ -545,14 +622,24 @@ export function useWebRTC({
     };
   };
 
-  // Handle incoming WebRTC signals with W3C Perfect Negotiation
+  // Handle incoming WebRTC signals with W3C Perfect Negotiation & in-band track metadata
   useEffect(() => {
     if (!socket) return;
 
-    socket.on('signal', async ({ senderPeerId, senderRole, signal }) => {
+    socket.on('signal', async ({ senderPeerId, senderRole, signal, trackMeta }) => {
       if (senderRole) {
         peerRolesRef.current.set(senderPeerId, senderRole);
       }
+
+      // 1. Immediately store track & stream metadata BEFORE setting remote description!
+      if (Array.isArray(trackMeta)) {
+        trackMeta.forEach(({ trackId, streamId, feedType }: { trackId: string; streamId?: string; feedType: VideoFeedType }) => {
+          if (trackId) trackMetadataRef.current.set(trackId, feedType);
+          if (streamId) streamMetadataRef.current.set(streamId, feedType);
+          console.log(`[WebRTC Signal Meta] In-band mapped track ${trackId} (stream: ${streamId}) -> ${feedType} from ${senderPeerId}`);
+        });
+      }
+
       let pc = peerConnections.current.get(senderPeerId);
 
       if (!pc) {
@@ -595,12 +682,13 @@ export function useWebRTC({
 
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
+            const myTrackMeta = getLocalTrackMeta();
             socket.emit('signal', {
               targetPeerId: senderPeerId,
               signal: answer,
+              trackMeta: myTrackMeta,
             });
-            syncLocalTracksToPc(senderPeerId, pc);
-            console.log(`[WebRTC] Answered offer from ${senderPeerId}`);
+            console.log(`[WebRTC] Answered offer from ${senderPeerId} with ${myTrackMeta.length} track metadata`);
           } else if (desc.type === 'answer') {
             if (pc.signalingState === 'have-local-offer') {
               await pc.setRemoteDescription(desc);
@@ -635,7 +723,7 @@ export function useWebRTC({
     return () => {
       socket.off('signal');
     };
-  }, [socket, createPeerConnection, isPolite, syncLocalTracksToPc]);
+  }, [socket, createPeerConnection, isPolite, syncLocalTracksToPc, getLocalTrackMeta]);
 
   // Connect to newly joined peers
   useEffect(() => {
@@ -653,14 +741,16 @@ export function useWebRTC({
         if (shouldInitiate) {
           try {
             makingOfferRef.current.set(peer.socketId, true);
+            syncLocalTracksToPc(peer.socketId, pc);
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
+            const myTrackMeta = getLocalTrackMeta();
             socket.emit('signal', {
               targetPeerId: peer.socketId,
               signal: offer,
+              trackMeta: myTrackMeta,
             });
-            syncLocalTracksToPc(peer.socketId, pc);
-            console.log(`[WebRTC] Sent initial offer to peer ${peer.socketId} (${peer.role})`);
+            console.log(`[WebRTC] Sent initial offer with ${myTrackMeta.length} track metadata to peer ${peer.socketId} (${peer.role})`);
           } catch (offerErr) {
             console.error('[WebRTC] Error creating/setting initial offer:', offerErr);
           } finally {
@@ -669,7 +759,7 @@ export function useWebRTC({
         }
       }
     });
-  }, [participants, socket, isConnected, role, createPeerConnection, syncLocalTracksToPc]);
+  }, [participants, socket, isConnected, role, createPeerConnection, syncLocalTracksToPc, getLocalTrackMeta]);
 
   // Audio mute/unmute
   const toggleAudio = useCallback(() => {

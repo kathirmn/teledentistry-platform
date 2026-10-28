@@ -52,13 +52,26 @@ export function useDeviceEnumeration() {
       setVideoDevices(vDevices);
       setAudioDevices(aDevices);
 
-      // Auto-assign default selections if not already chosen
-      if (vDevices.length > 0) {
+      // Smart auto-assign device selections: distinguish built-in webcam from USB intraoral wand
+      if (vDevices.length === 1) {
+        // Exactly 1 camera available: assign to clinician webcam, leave intraoral empty awaiting USB wand
         setSelectedWebcamId((prev) => prev || vDevices[0].deviceId);
-      }
-      if (vDevices.length > 1) {
-        // If there's a second camera, assign it as intraoral candidate
-        setSelectedIntraoralId((prev) => prev || vDevices[1].deviceId);
+      } else if (vDevices.length > 1) {
+        // 2 or more cameras: detect external intraoral wand vs clinician face webcam
+        const intraKeywords = /intraoral|dental|wand|endoscope|mouth|uvc|usb\s*video|external/i;
+        const webcamKeywords = /facetime|integrated|internal|built-in|front|webcam/i;
+
+        const candidateIntra = vDevices.find((d) => intraKeywords.test(d.label));
+        const candidateWebcam = vDevices.find((d) => webcamKeywords.test(d.label));
+
+        if (candidateIntra && candidateWebcam) {
+          setSelectedIntraoralId((prev) => prev || candidateIntra.deviceId);
+          setSelectedWebcamId((prev) => prev || candidateWebcam.deviceId);
+        } else {
+          // Fallback: first camera as webcam, second as intraoral
+          setSelectedWebcamId((prev) => prev || vDevices[0].deviceId);
+          setSelectedIntraoralId((prev) => prev || vDevices[1].deviceId);
+        }
       }
       if (aDevices.length > 0) {
         setSelectedAudioId((prev) => prev || aDevices[0].deviceId);
