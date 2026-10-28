@@ -22,9 +22,9 @@ let iceServersExpiresAt = 0;
 
 // Fetch secure, time-limited STUN/TURN credentials from Xirsys REST API
 async function getXirsysIceServers() {
-  const ident = process.env.XIRSYS_IDENT;
-  const secret = process.env.XIRSYS_SECRET;
-  const channel = process.env.XIRSYS_CHANNEL;
+  const ident = process.env.XIRSYS_IDENT || 'Tony';
+  const secret = process.env.XIRSYS_SECRET || 'e4f5f0f6-d2ef-11f1-9a38-0242ac140002';
+  const channel = process.env.XIRSYS_CHANNEL || 'channele699b410';
   const gateway = process.env.XIRSYS_GATEWAY || 'https://global.xirsys.net';
 
   if (!ident || !secret || !channel) {
@@ -274,6 +274,15 @@ app.prepare().then(async () => {
         senderRole: currentUser?.role || 'senior-doctor',
         signal,
         streamType,
+      });
+    });
+
+    // WebRTC Track Metadata routing (deterministic intraoral vs webcam identification)
+    socket.on('track-metadata', ({ targetPeerId, tracks }) => {
+      io.to(targetPeerId).emit('track-metadata', {
+        senderPeerId: socket.id,
+        senderRole: currentUser?.role || 'senior-doctor',
+        tracks,
       });
     });
 

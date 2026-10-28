@@ -134,6 +134,7 @@ export default function ClinicalRoomPage() {
     serverConfig,
     socket,
     isMobileBackgrounded,
+    iceConnectionState,
   } = useWebRTC({
     roomId,
     role,
@@ -316,6 +317,7 @@ export default function ClinicalRoomPage() {
         snapshotCount={caseSnapshots.length}
         unreadChatCount={unreadChatCount}
         onLeaveCall={handleLeaveCall}
+        iceConnectionState={iceConnectionState}
       />
 
       {/* Safari Audio Autoplay Unlock Banner */}

@@ -63,6 +63,12 @@ export function useWebRTC({
   const peerRolesRef = useRef<Map<string, ParticipantRole>>(new Map());
   const iceCandidatesQueue = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
 
+  // W3C Perfect Negotiation & Track Identification state
+  const senderFeedMap = useRef<Map<string, Map<RTCRtpSender, VideoFeedType | 'audio'>>>(new Map());
+  const trackMetadataRef = useRef<Map<string, VideoFeedType>>(new Map());
+  const makingOfferRef = useRef<Map<string, boolean>>(new Map());
+  const [iceConnectionState, setIceConnectionState] = useState<RTCIceConnectionState>('new');
+
   // ICE Servers (Xirsys STUN/TURN servers for robust NAT/firewall traversal)
   const rtcConfigRef = useRef<RTCConfiguration>({
     iceServers: [
@@ -142,6 +148,8 @@ export function useWebRTC({
       }
       iceCandidatesQueue.current.delete(socketId);
       peerRolesRef.current.delete(socketId);
+      senderFeedMap.current.delete(socketId);
+      makingOfferRef.current.delete(socketId);
       const existingAudioEl = document.getElementById(`audio-peer-${socketId}`);
       if (existingAudioEl) existingAudioEl.remove();
       setRemoteFeeds((prev) => {
@@ -151,6 +159,32 @@ export function useWebRTC({
         }
         return next;
       });
+    });
+
+    // Deterministic WebRTC track-to-feed mapping
+    s.on('track-metadata', ({ senderPeerId, tracks }: { senderPeerId: string; tracks: Array<{ trackId: string; feedType: VideoFeedType }> }) => {
+      if (Array.isArray(tracks)) {
+        tracks.forEach(({ trackId, feedType }) => {
+          trackMetadataRef.current.set(trackId, feedType);
+          console.log(`[WebRTC TrackMeta] Mapped track ${trackId} -> ${feedType} from ${senderPeerId}`);
+
+          // Update any already-attached remote feeds
+          setRemoteFeeds((prev) => {
+            const next = new Map(prev);
+            let updated = false;
+            for (const [key, val] of next.entries()) {
+              if (val.peerId === senderPeerId && val.stream.getVideoTracks().some((t) => t.id === trackId)) {
+                if (val.feedType !== feedType) {
+                  next.delete(key);
+                  next.set(`${senderPeerId}-${feedType}`, { stream: val.stream, feedType, peerId: senderPeerId });
+                  updated = true;
+                }
+              }
+            }
+            return updated ? next : prev;
+          });
+        });
+      }
     });
 
     s.on('telestration-stroke', (data) => onStrokeReceived?.(data));
@@ -261,6 +295,103 @@ export function useWebRTC({
     };
   }, [socket, role, webcamStream, intraoralStream, participantName]);
 
+  // Determine if this client acts as the polite peer during offer collisions (W3C Perfect Negotiation)
+  const isPolite = useCallback(
+    (targetPeerId: string) => {
+      const peerRole = peerRolesRef.current.get(targetPeerId);
+      // Senior specialist is polite mentor; junior dentist is authoritative clinic host
+      if (role === 'senior-doctor') return true;
+      if (peerRole === 'senior-doctor') return false;
+      return socket?.id ? socket.id < targetPeerId : true;
+    },
+    [role, socket]
+  );
+
+  // Synchronize local audio and video tracks onto a peer connection
+  const syncLocalTracksToPc = useCallback(
+    (targetPeerId: string, pc: RTCPeerConnection) => {
+      const targetRole = peerRolesRef.current.get(targetPeerId);
+      if (targetRole === 'mobile-cam') return; // Mobile is receive-only
+
+      if (!senderFeedMap.current.has(targetPeerId)) {
+        senderFeedMap.current.set(targetPeerId, new Map());
+      }
+      const peerSenderMap = senderFeedMap.current.get(targetPeerId)!;
+      const senders = pc.getSenders();
+      const trackMeta: Array<{ trackId: string; feedType: VideoFeedType }> = [];
+
+      // 1. Audio track synchronization
+      if (audioStream) {
+        const audioTrack = audioStream.getAudioTracks()[0];
+        if (audioTrack) {
+          let audioSender = senders.find((s) => s.track?.kind === 'audio' || peerSenderMap.get(s) === 'audio');
+          if (audioSender) {
+            audioSender.replaceTrack(audioTrack).catch(console.warn);
+          } else {
+            try {
+              audioSender = pc.addTrack(audioTrack, audioStream);
+              peerSenderMap.set(audioSender, 'audio');
+            } catch (e) {
+              console.warn('[WebRTC] Error adding audio track:', e);
+            }
+          }
+        }
+      }
+
+      // 2. Intraoral camera track synchronization (Junior Dentist only)
+      if (role === 'junior-dentist' && intraoralStream) {
+        const intraTrack = intraoralStream.getVideoTracks()[0];
+        if (intraTrack) {
+          trackMeta.push({ trackId: intraTrack.id, feedType: 'intraoral' });
+          let intraSender = senders.find((s) => peerSenderMap.get(s) === 'intraoral');
+          if (intraSender) {
+            intraSender.replaceTrack(intraTrack).catch(console.warn);
+          } else {
+            try {
+              intraSender = pc.addTrack(intraTrack, intraoralStream);
+              peerSenderMap.set(intraSender, 'intraoral');
+            } catch (e) {
+              console.warn('[WebRTC] Error adding intraoral track:', e);
+            }
+          }
+        }
+      }
+
+      // 3. Webcam track synchronization (Junior Dentist face webcam or Senior Doctor camera)
+      if (webcamStream) {
+        const webTrack = webcamStream.getVideoTracks()[0];
+        if (webTrack) {
+          const feedType: VideoFeedType = role === 'junior-dentist' ? 'webcam' : 'senior-cam';
+          trackMeta.push({ trackId: webTrack.id, feedType });
+          let webSender = senders.find((s) => peerSenderMap.get(s) === feedType);
+          if (webSender) {
+            webSender.replaceTrack(webTrack).catch(console.warn);
+          } else {
+            try {
+              webSender = pc.addTrack(webTrack, webcamStream);
+              peerSenderMap.set(webSender, feedType);
+            } catch (e) {
+              console.warn('[WebRTC] Error adding webcam track:', e);
+            }
+          }
+        }
+      }
+
+      // 4. Broadcast track metadata to target peer so receiver maps tracks deterministically
+      if (trackMeta.length > 0 && socket) {
+        socket.emit('track-metadata', { targetPeerId, tracks: trackMeta });
+      }
+    },
+    [role, audioStream, intraoralStream, webcamStream, socket]
+  );
+
+  // Whenever local media streams become available or change, sync to all existing peer connections!
+  useEffect(() => {
+    peerConnections.current.forEach((pc, targetPeerId) => {
+      syncLocalTracksToPc(targetPeerId, pc);
+    });
+  }, [audioStream, intraoralStream, webcamStream, syncLocalTracksToPc]);
+
   // Create WebRTC Peer Connection
   const createPeerConnection = useCallback(
     (targetPeerId: string, isInitiator: boolean) => {
@@ -275,18 +406,8 @@ export function useWebRTC({
       const isMobile = targetRole === 'mobile-cam';
 
       if (!isMobile) {
-        // Add local audio track
-        if (audioStream) {
-          audioStream.getTracks().forEach((track) => pc.addTrack(track, audioStream));
-        }
-
-        // Add local video tracks
-        if (webcamStream) {
-          webcamStream.getTracks().forEach((track) => pc.addTrack(track, webcamStream));
-        }
-        if (intraoralStream) {
-          intraoralStream.getTracks().forEach((track) => pc.addTrack(track, intraoralStream));
-        }
+        // Sync any currently available local tracks immediately
+        syncLocalTracksToPc(targetPeerId, pc);
 
         // Setup DataChannel for ultra low latency strokes ONLY between doctors/clinicians (never mobile camera)
         if (isInitiator) {
@@ -303,6 +424,26 @@ export function useWebRTC({
             dataChannels.current.set(targetPeerId, e.channel);
           };
         }
+
+        // Setup W3C onnegotiationneeded handler
+        pc.onnegotiationneeded = async () => {
+          try {
+            makingOfferRef.current.set(targetPeerId, true);
+            const offer = await pc.createOffer();
+            if (pc.signalingState !== 'stable') return;
+            await pc.setLocalDescription(offer);
+            socket?.emit('signal', {
+              targetPeerId,
+              signal: offer,
+            });
+            syncLocalTracksToPc(targetPeerId, pc);
+            console.log(`[WebRTC] Sent renegotiation offer to ${targetPeerId}`);
+          } catch (err) {
+            console.warn(`[WebRTC] Negotiation error with ${targetPeerId}:`, err);
+          } finally {
+            makingOfferRef.current.set(targetPeerId, false);
+          }
+        };
       } else {
         // For mobile companion camera: receive-only, zero unnecessary PC uplink encoding, zero SCTP data channel!
         try {
@@ -312,6 +453,24 @@ export function useWebRTC({
           console.warn('[WebRTC] addTransceiver fallback:', tErr);
         }
       }
+
+      // Connection health & ICE state listeners
+      pc.oniceconnectionstatechange = () => {
+        console.log(`[WebRTC] ICE state with ${targetPeerId}: ${pc.iceConnectionState}`);
+        setIceConnectionState(pc.iceConnectionState);
+        if (pc.iceConnectionState === 'failed') {
+          console.warn(`[WebRTC] ICE failed with ${targetPeerId}. Attempting ICE restart...`);
+          try {
+            pc.restartIce();
+          } catch (iceErr) {
+            console.warn('[WebRTC] Error restarting ICE:', iceErr);
+          }
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        console.log(`[WebRTC] Connection state with ${targetPeerId}: ${pc.connectionState}`);
+      };
 
       // Send ICE candidates to peer via socket
       pc.onicecandidate = (e) => {
@@ -346,25 +505,19 @@ export function useWebRTC({
         }
 
         if (track.kind === 'video') {
-          // Identify peer role directly from synchronized lookup map
-          const peerRole = peerRolesRef.current.get(targetPeerId);
-          let feedType: VideoFeedType = 'mobile';
-
-          if (peerRole === 'mobile-cam') {
-            feedType = 'mobile';
-          } else if (peerRole === 'senior-doctor') {
-            feedType = 'senior-cam';
-          } else if (peerRole === 'junior-dentist') {
-            // Junior dentist PC sends intraoral first, webcam second
-            const existingFromPeer = Array.from(remoteFeeds.values()).filter((f) => f.peerId === targetPeerId);
-            feedType = existingFromPeer.length === 0 ? 'intraoral' : 'webcam';
+          // Identify feedType deterministically via trackMetadataRef
+          let feedType: VideoFeedType;
+          if (trackMetadataRef.current.has(track.id)) {
+            feedType = trackMetadataRef.current.get(track.id)!;
           } else {
-            // Fallback: if user is junior-dentist, any unknown incoming video is mobile or senior
-            feedType = role === 'junior-dentist' ? 'mobile' : 'senior-cam';
+            const peerRole = peerRolesRef.current.get(targetPeerId);
+            if (peerRole === 'senior-doctor') feedType = 'senior-cam';
+            else if (peerRole === 'mobile-cam') feedType = 'mobile';
+            else feedType = 'intraoral';
           }
 
-          console.log(`[WebRTC ontrack] Incoming track from ${targetPeerId} (role: ${peerRole}) mapped to feedType: ${feedType}`);
-          const feedKey = `${targetPeerId}-${track.id}`;
+          console.log(`[WebRTC ontrack] Incoming video track ${track.id} from ${targetPeerId} mapped to feedType: ${feedType}`);
+          const feedKey = `${targetPeerId}-${feedType}`;
           const finalStream = incomingStream || new MediaStream([track]);
 
           setRemoteFeeds((prev) => {
@@ -377,7 +530,7 @@ export function useWebRTC({
 
       return pc;
     },
-    [socket, audioStream, webcamStream, intraoralStream, role, remoteFeeds.size]
+    [socket, syncLocalTracksToPc]
   );
 
   const setupDataChannel = (dc: RTCDataChannel) => {
@@ -392,7 +545,7 @@ export function useWebRTC({
     };
   };
 
-  // Handle incoming WebRTC signals
+  // Handle incoming WebRTC signals with W3C Perfect Negotiation
   useEffect(() => {
     if (!socket) return;
 
@@ -411,15 +564,20 @@ export function useWebRTC({
           const desc = new RTCSessionDescription(signal as RTCSessionDescriptionInit);
 
           if (desc.type === 'offer') {
-            if (pc.signalingState !== 'stable') {
-              console.warn('[WebRTC PC] Offer collision in state:', pc.signalingState);
-              if (senderRole === 'mobile-cam') {
-                return; // PC is the offerer for mobile; ignore rogue offers
+            const isMakingOffer = Boolean(makingOfferRef.current.get(senderPeerId));
+            const offerCollision = isMakingOffer || pc.signalingState !== 'stable';
+            const polite = isPolite(senderPeerId);
+
+            if (offerCollision) {
+              if (!polite) {
+                console.warn(`[WebRTC] Ignoring colliding offer from ${senderPeerId} (impolite host)`);
+                return;
               }
+              console.log(`[WebRTC] Rolling back local offer for ${senderPeerId} (polite mentor)`);
               try {
                 await pc.setLocalDescription({ type: 'rollback' });
               } catch (rbErr) {
-                console.warn('[WebRTC PC] Rollback error:', rbErr);
+                console.warn('[WebRTC] Rollback error:', rbErr);
               }
             }
 
@@ -432,13 +590,17 @@ export function useWebRTC({
             }
             iceCandidatesQueue.current.delete(senderPeerId);
 
+            // Make sure our local tracks are attached before answering
+            syncLocalTracksToPc(senderPeerId, pc);
+
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             socket.emit('signal', {
               targetPeerId: senderPeerId,
               signal: answer,
             });
-            console.log(`[WebRTC PC] Answered offer from ${senderPeerId}`);
+            syncLocalTracksToPc(senderPeerId, pc);
+            console.log(`[WebRTC] Answered offer from ${senderPeerId}`);
           } else if (desc.type === 'answer') {
             if (pc.signalingState === 'have-local-offer') {
               await pc.setRemoteDescription(desc);
@@ -449,7 +611,7 @@ export function useWebRTC({
                 await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(console.warn);
               }
               iceCandidatesQueue.current.delete(senderPeerId);
-              console.log(`[WebRTC PC] Remote answer accepted from ${senderPeerId}`);
+              console.log(`[WebRTC] Remote answer accepted from ${senderPeerId}`);
             }
           }
         } else if ('candidate' in signal && signal.candidate) {
@@ -457,7 +619,7 @@ export function useWebRTC({
             try {
               await pc.addIceCandidate(new RTCIceCandidate(signal as RTCIceCandidateInit));
             } catch (iceErr) {
-              console.warn('[WebRTC PC] ICE candidate error:', iceErr);
+              console.warn('[WebRTC] ICE candidate error:', iceErr);
             }
           } else {
             const queue = iceCandidatesQueue.current.get(senderPeerId) || [];
@@ -466,14 +628,14 @@ export function useWebRTC({
           }
         }
       } catch (err) {
-        console.error('[WebRTC PC] Signal handling error:', err);
+        console.error('[WebRTC] Signal handling error:', err);
       }
     });
 
     return () => {
       socket.off('signal');
     };
-  }, [socket, createPeerConnection]);
+  }, [socket, createPeerConnection, isPolite, syncLocalTracksToPc]);
 
   // Connect to newly joined peers
   useEffect(() => {
@@ -484,21 +646,30 @@ export function useWebRTC({
       peerRolesRef.current.set(peer.socketId, peer.role);
 
       if (!peerConnections.current.has(peer.socketId)) {
-        const pc = createPeerConnection(peer.socketId, true);
-        try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit('signal', {
-            targetPeerId: peer.socketId,
-            signal: offer,
-          });
-          console.log(`[WebRTC PC] Sent offer to peer ${peer.socketId} (${peer.role})`);
-        } catch (offerErr) {
-          console.error('[WebRTC PC] Error creating/setting offer:', offerErr);
+        // Designate initial offer initiator: junior clinic is primary host; senior doctor answers
+        const shouldInitiate = role === 'junior-dentist' || peer.role === 'mobile-cam' || ((socket.id || '') < peer.socketId);
+        const pc = createPeerConnection(peer.socketId, shouldInitiate);
+
+        if (shouldInitiate) {
+          try {
+            makingOfferRef.current.set(peer.socketId, true);
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit('signal', {
+              targetPeerId: peer.socketId,
+              signal: offer,
+            });
+            syncLocalTracksToPc(peer.socketId, pc);
+            console.log(`[WebRTC] Sent initial offer to peer ${peer.socketId} (${peer.role})`);
+          } catch (offerErr) {
+            console.error('[WebRTC] Error creating/setting initial offer:', offerErr);
+          } finally {
+            makingOfferRef.current.set(peer.socketId, false);
+          }
         }
       }
     });
-  }, [participants, socket, isConnected, createPeerConnection]);
+  }, [participants, socket, isConnected, role, createPeerConnection, syncLocalTracksToPc]);
 
   // Audio mute/unmute
   const toggleAudio = useCallback(() => {
@@ -627,5 +798,6 @@ export function useWebRTC({
     connectionWarning,
     serverConfig,
     isMobileBackgrounded,
+    iceConnectionState,
   };
 }

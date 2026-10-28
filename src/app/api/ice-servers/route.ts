@@ -12,9 +12,9 @@ let cachedServers: any[] | null = null;
 let cacheExpiry = 0;
 
 export async function GET() {
-  const ident = process.env.XIRSYS_IDENT;
-  const secret = process.env.XIRSYS_SECRET;
-  const channel = process.env.XIRSYS_CHANNEL;
+  const ident = process.env.XIRSYS_IDENT || 'Tony';
+  const secret = process.env.XIRSYS_SECRET || 'e4f5f0f6-d2ef-11f1-9a38-0242ac140002';
+  const channel = process.env.XIRSYS_CHANNEL || 'channele699b410';
   const gateway = process.env.XIRSYS_GATEWAY || 'https://global.xirsys.net';
 
   if (!ident || !secret || !channel) {

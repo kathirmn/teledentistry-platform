@@ -32,6 +32,7 @@ interface SessionHeaderProps {
   snapshotCount: number;
   unreadChatCount: number;
   onLeaveCall: () => void;
+  iceConnectionState?: RTCIceConnectionState;
 }
 
 export function SessionHeader({
@@ -49,6 +50,7 @@ export function SessionHeader({
   snapshotCount,
   unreadChatCount,
   onLeaveCall,
+  iceConnectionState,
 }: SessionHeaderProps) {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [copied, setCopied] = useState(false);
@@ -119,6 +121,36 @@ export function SessionHeader({
           <span className="flex items-center gap-1 text-[11px] text-slate-400 font-mono ml-2">
             <Users className="w-3.5 h-3.5 text-slate-500" /> {participants.length + 1} present
           </span>
+          {iceConnectionState && (
+            <span
+              className={`hidden xl:inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded border ml-2 ${
+                iceConnectionState === 'connected' || iceConnectionState === 'completed'
+                  ? 'bg-emerald-950/80 text-emerald-300 border-emerald-800'
+                  : iceConnectionState === 'checking'
+                  ? 'bg-amber-950/80 text-amber-300 border-amber-800 animate-pulse'
+                  : iceConnectionState === 'failed'
+                  ? 'bg-rose-950/80 text-rose-300 border-rose-800'
+                  : 'bg-slate-900 text-slate-400 border-slate-700'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  iceConnectionState === 'connected' || iceConnectionState === 'completed'
+                    ? 'bg-emerald-400'
+                    : iceConnectionState === 'checking'
+                    ? 'bg-amber-400'
+                    : 'bg-rose-500'
+                }`}
+              />
+              {iceConnectionState === 'connected' || iceConnectionState === 'completed'
+                ? 'WebRTC Live'
+                : iceConnectionState === 'checking'
+                ? 'Negotiating...'
+                : iceConnectionState === 'failed'
+                ? 'Relay Reconnecting'
+                : iceConnectionState}
+            </span>
+          )}
         </div>
       </div>
 
