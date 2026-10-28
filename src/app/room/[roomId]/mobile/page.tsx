@@ -56,16 +56,35 @@ export default function MobileCompanionPage() {
       .catch(() => {});
   }, []);
 
-  // Helper to attach local tracks to a peer connection
-  const attachTracksToPc = useCallback((pc: RTCPeerConnection) => {
+  const hasJoinedRoomRef = useRef(false);
+
+  // Helper to bind local camera tracks to remote offered transceivers
+  const bindTracksToOffer = useCallback(async (pc: RTCPeerConnection) => {
     if (!streamRef.current) return;
-    const senders = pc.getSenders();
-    streamRef.current.getTracks().forEach((track) => {
-      const alreadyHasTrack = senders.some((s) => s.track?.kind === track.kind);
-      if (!alreadyHasTrack) {
-        pc.addTrack(track, streamRef.current!);
-      }
-    });
+    const videoTrack = streamRef.current.getVideoTracks()[0];
+    const audioTrack = streamRef.current.getAudioTracks()[0];
+
+    const transceivers = pc.getTransceivers();
+    const videoTransceiver = transceivers.find(
+      (t) => t.receiver.track?.kind === 'video' || t.sender.track?.kind === 'video'
+    );
+    const audioTransceiver = transceivers.find(
+      (t) => t.receiver.track?.kind === 'audio' || t.sender.track?.kind === 'audio'
+    );
+
+    if (videoTransceiver && videoTrack) {
+      videoTransceiver.direction = 'sendonly';
+      await videoTransceiver.sender.replaceTrack(videoTrack);
+    } else if (videoTrack) {
+      pc.addTrack(videoTrack, streamRef.current);
+    }
+
+    if (audioTransceiver && audioTrack) {
+      audioTransceiver.direction = 'sendonly';
+      await audioTransceiver.sender.replaceTrack(audioTrack);
+    } else if (audioTrack) {
+      pc.addTrack(audioTrack, streamRef.current);
+    }
   }, []);
 
   // Create or get peer connection for a target peer (Mobile acts as responder)
@@ -78,9 +97,6 @@ export default function MobileCompanionPage() {
       const pc = new RTCPeerConnection(rtcConfigRef.current);
       peerConnections.current.set(targetPeerId, pc);
 
-      // Attach current stream tracks immediately
-      attachTracksToPc(pc);
-
       pc.onicecandidate = (e) => {
         if (e.candidate && socketRef.current) {
           socketRef.current.emit('signal', {
@@ -91,9 +107,13 @@ export default function MobileCompanionPage() {
         }
       };
 
+      pc.oniceconnectionstatechange = () => {
+        console.log(`[Mobile WebRTC] ICE state with ${targetPeerId}: ${pc.iceConnectionState}`);
+      };
+
       return pc;
     },
-    [attachTracksToPc]
+    []
   );
 
   // Start mobile camera stream
@@ -154,21 +174,32 @@ export default function MobileCompanionPage() {
 
       setVideoStatus('Streaming Live to Clinic PC');
 
-      // Update tracks on all active peer connections seamlessly via replaceTrack
+      // Update tracks on all active peer connections seamlessly via bindTracksToOffer
       peerConnections.current.forEach(async (pc) => {
-        const senders = pc.getSenders();
-        const videoSender = senders.find((s) => s.track?.kind === 'video');
-        if (videoSender && track) {
-          await videoSender.replaceTrack(track);
-        } else {
-          attachTracksToPc(pc);
-        }
+        await bindTracksToOffer(pc);
       });
+
+      // Join room now that camera hardware is verified active
+      joinRoomIfReady();
     } catch (err: any) {
       console.error('Mobile camera start error:', err);
       setVideoStatus(`Camera Error: ${err?.message || 'Access Denied'}`);
     }
   };
+
+  const joinRoomIfReady = useCallback(() => {
+    if (hasJoinedRoomRef.current) return;
+    if (socketRef.current?.connected && streamRef.current) {
+      hasJoinedRoomRef.current = true;
+      console.log(`[Mobile Companion] Camera ready and socket connected. Joining room: ${roomId}`);
+      socketRef.current.emit('join-room', {
+        roomId,
+        role: 'mobile-cam',
+        participantId: `mobile-${Date.now()}`,
+        name: 'Mobile Companion Cam',
+      });
+    }
+  }, [roomId]);
 
   useEffect(() => {
     startCamera(facingMode);
@@ -205,12 +236,7 @@ export default function MobileCompanionPage() {
 
     s.on('connect', () => {
       setIsConnected(true);
-      s.emit('join-room', {
-        roomId,
-        role: 'mobile-cam',
-        participantId: `mobile-${Date.now()}`,
-        name: 'Mobile Companion Cam',
-      });
+      joinRoomIfReady();
     });
 
     s.on('disconnect', () => setIsConnected(false));
@@ -230,8 +256,6 @@ export default function MobileCompanionPage() {
       try {
         if ('sdp' in signal) {
           if (signal.type === 'offer') {
-            attachTracksToPc(pc);
-
             // If we have an unexpected local offer in-flight, rollback safely
             if (pc.signalingState !== 'stable') {
               try {
@@ -241,24 +265,41 @@ export default function MobileCompanionPage() {
               }
             }
 
+            // 1. Establish offered transceivers from remote description
             await pc.setRemoteDescription(new RTCSessionDescription(signal));
 
-            // Drain queued ICE candidates
+            // 2. Bind active camera tracks to the offered transceivers (direction: sendonly)
+            await bindTracksToOffer(pc);
+
+            // 3. Drain queued ICE candidates
             const queued = iceCandidatesQueue.current.get(senderPeerId) || [];
             for (const cand of queued) {
               await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(console.warn);
             }
             iceCandidatesQueue.current.delete(senderPeerId);
 
+            // 4. Create answer
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
+
+            const videoTrack = streamRef.current?.getVideoTracks()[0];
+            const trackMeta = videoTrack
+              ? [
+                  {
+                    trackId: videoTrack.id,
+                    streamId: streamRef.current?.id,
+                    feedType: 'mobile',
+                  },
+                ]
+              : [];
 
             s.emit('signal', {
               targetPeerId: senderPeerId,
               signal: answer,
               streamType: 'mobile',
+              trackMeta,
             });
-            console.log(`[Mobile WebRTC] Answered offer from peer ${senderPeerId}`);
+            console.log(`[Mobile WebRTC] Answered offer from peer ${senderPeerId} with ${trackMeta.length} tracks`);
           } else if (signal.type === 'answer') {
             if (pc.signalingState === 'have-local-offer') {
               await pc.setRemoteDescription(new RTCSessionDescription(signal));
@@ -300,7 +341,7 @@ export default function MobileCompanionPage() {
     return () => {
       s.disconnect();
     };
-  }, [roomId, getOrCreatePeerConnection, attachTracksToPc]);
+  }, [roomId, getOrCreatePeerConnection, bindTracksToOffer, joinRoomIfReady]);
 
   // Toggle Torch/Flashlight
   const toggleTorch = async () => {

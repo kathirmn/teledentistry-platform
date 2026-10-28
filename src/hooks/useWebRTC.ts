@@ -471,27 +471,6 @@ export function useWebRTC({
           };
         }
 
-        // Setup W3C onnegotiationneeded handler
-        pc.onnegotiationneeded = async () => {
-          try {
-            makingOfferRef.current.set(targetPeerId, true);
-            syncLocalTracksToPc(targetPeerId, pc);
-            const offer = await pc.createOffer();
-            if (pc.signalingState !== 'stable') return;
-            await pc.setLocalDescription(offer);
-            const trackMeta = getLocalTrackMeta();
-            socket?.emit('signal', {
-              targetPeerId,
-              signal: offer,
-              trackMeta,
-            });
-            console.log(`[WebRTC] Sent renegotiation offer with ${trackMeta.length} track metadata to ${targetPeerId}`);
-          } catch (err) {
-            console.warn(`[WebRTC] Negotiation error with ${targetPeerId}:`, err);
-          } finally {
-            makingOfferRef.current.set(targetPeerId, false);
-          }
-        };
       } else {
         // For mobile companion camera: receive-only, zero unnecessary PC uplink encoding, zero SCTP data channel!
         try {
@@ -501,6 +480,28 @@ export function useWebRTC({
           console.warn('[WebRTC] addTransceiver fallback:', tErr);
         }
       }
+
+      // Setup W3C onnegotiationneeded handler
+      pc.onnegotiationneeded = async () => {
+        try {
+          makingOfferRef.current.set(targetPeerId, true);
+          if (!isMobile) syncLocalTracksToPc(targetPeerId, pc);
+          const offer = await pc.createOffer();
+          if (pc.signalingState !== 'stable') return;
+          await pc.setLocalDescription(offer);
+          const trackMeta = isMobile ? [] : getLocalTrackMeta();
+          socket?.emit('signal', {
+            targetPeerId,
+            signal: offer,
+            trackMeta,
+          });
+          console.log(`[WebRTC] Sent renegotiation offer with ${trackMeta.length} track metadata to ${targetPeerId} (isMobile: ${isMobile})`);
+        } catch (err) {
+          console.warn(`[WebRTC] Negotiation error with ${targetPeerId}:`, err);
+        } finally {
+          makingOfferRef.current.set(targetPeerId, false);
+        }
+      };
 
       // Connection health & ICE state listeners
       pc.oniceconnectionstatechange = () => {
@@ -553,10 +554,12 @@ export function useWebRTC({
         }
 
         if (track.kind === 'video') {
-          // Identify feedType deterministically via trackMetadataRef or streamMetadataRef
+          // Identify feedType deterministically via trackMetadataRef, streamMetadataRef, or isMobile
           let feedType: VideoFeedType | undefined =
-            trackMetadataRef.current.get(track.id) ||
-            (incomingStream && streamMetadataRef.current.get(incomingStream.id));
+            isMobile
+              ? 'mobile'
+              : trackMetadataRef.current.get(track.id) ||
+                (incomingStream && streamMetadataRef.current.get(incomingStream.id));
 
           if (!feedType) {
             const peerRole = peerRolesRef.current.get(targetPeerId);
