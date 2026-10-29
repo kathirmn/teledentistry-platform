@@ -261,6 +261,24 @@ export default function ClinicalRoomPage() {
 
             const webResult = await acquireCameraWithFallback(targetWebId, false);
             const track = webResult.stream.getVideoTracks()[0];
+            const intraTrack = activeIntraoralRef.current?.getVideoTracks()[0];
+
+            // Prevent duplicate camera stream assignment if browser ever returned intraoral device
+            if (
+              intraTrack &&
+              track &&
+              (track.id === intraTrack.id ||
+                (track.getSettings().deviceId &&
+                  track.getSettings().deviceId === intraTrack.getSettings().deviceId))
+            ) {
+              console.error(
+                '[Hardware] Duplicate camera stream detected between intraoral and webcam! Rejecting duplicate.'
+              );
+              stopMediaStream(webResult.stream);
+              if (isMounted) setWebcamStream(null);
+              return;
+            }
+
             if (track) {
               track.onended = () => {
                 console.warn('[Hardware] Clinician webcam unplugged/ended');

@@ -116,11 +116,11 @@ export function useDeviceEnumeration() {
   /**
    * Acquire camera stream with an automatic fallback ladder to solve USB 2.0/3.0 Root Hub Contention
    * and Windows UVC driver constraints.
-   * Tries:
-   * 1. Exact deviceId at 1080p (intraoral) or 720p (webcam)
-   * 2. Ideal deviceId at 720p @ 15fps
-   * 3. Ideal deviceId at 640x480 @ 15fps (safe universal resolution)
-   * 4. Relaxed deviceId constraints (uncompressed/MJPEG fallback)
+   *
+   * CRITICAL FIX: Every ladder step MUST strictly preserve `deviceId: { exact: deviceId }`.
+   * Never use `ideal: deviceId`, as browsers (Chrome/Edge on Windows) will silently fall back
+   * to the first/default camera if the requested camera cannot satisfy the resolution constraint,
+   * causing one camera to duplicate into both viewports!
    */
   const acquireCameraWithFallback = useCallback(
     async (deviceId: string, isIntraoral = false): Promise<CameraStreamResult> => {
@@ -130,57 +130,60 @@ export function useDeviceEnumeration() {
         throw new Error('No device ID specified for camera acquisition');
       }
 
-      // Resolution ladder with exact device ID first, then ideal device ID
+      // Strict resolution ladder: always locking to exact deviceId
       const constraintLadder: MediaTrackConstraints[] = isIntraoral
         ? [
-            // Ladder 1: High definition for intraoral inspection (exact device)
+            // Intraoral Ladder 1: 1080p for macro dental inspection
             {
               deviceId: { exact: deviceId },
               width: { ideal: 1920 },
               height: { ideal: 1080 },
               frameRate: { ideal: 20 },
             },
-            // Ladder 2: Exact device at 720p (saves USB bus endpoints)
+            // Intraoral Ladder 2: 720p if 1080p saturated USB bus
             {
               deviceId: { exact: deviceId },
               width: { ideal: 1280 },
               height: { ideal: 720 },
               frameRate: { ideal: 15 },
             },
-            // Ladder 3: Ideal device at 720p (handles Windows UVC deviceId hash mismatch)
+            // Intraoral Ladder 3: 480p universal fallback
             {
-              deviceId: { ideal: deviceId },
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-              frameRate: { ideal: 15 },
-            },
-            // Ladder 4: 480p universal fallback
-            {
-              deviceId: { ideal: deviceId },
+              deviceId: { exact: deviceId },
               width: { ideal: 640 },
               height: { ideal: 480 },
               frameRate: { ideal: 15 },
+            },
+            // Intraoral Ladder 4: Native default (no resolution constraint)
+            {
+              deviceId: { exact: deviceId },
             },
           ]
         : [
-            // Webcam ladder (optimized to save USB bandwidth for intraoral)
+            // Webcam Ladder 1: 720p for clinician face
             {
               deviceId: { exact: deviceId },
               width: { ideal: 1280 },
               height: { ideal: 720 },
               frameRate: { ideal: 15 },
             },
+            // Webcam Ladder 2: 480p standard VGA (native to USB 2.0 PC cameras like 1908:2311)
             {
-              deviceId: { ideal: deviceId },
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-              frameRate: { ideal: 15 },
-            },
-            {
-              deviceId: { ideal: deviceId },
+              deviceId: { exact: deviceId },
               width: { ideal: 640 },
               height: { ideal: 480 },
               frameRate: { ideal: 15 },
+            },
+            // Webcam Ladder 3: 240p low bandwidth
+            {
+              deviceId: { exact: deviceId },
+              width: { ideal: 320 },
+              height: { ideal: 240 },
+              frameRate: { ideal: 15 },
+            },
+            // Webcam Ladder 4: Native default (no resolution constraint)
+            {
+              deviceId: { exact: deviceId },
             },
           ];
 
@@ -198,6 +201,16 @@ export function useDeviceEnumeration() {
           const settings = track.getSettings();
           const fallbackUsed = i > 0;
 
+          // CRITICAL: Guarantee device isolation!
+          // Reject any stream where the browser returned a different physical device
+          if (settings.deviceId && settings.deviceId !== deviceId) {
+            console.error(
+              `[Hardware] Browser returned wrong deviceId "${settings.deviceId}" instead of requested "${deviceId}". Aborting stream.`
+            );
+            track.stop();
+            throw new Error(`Device mismatch: requested ${deviceId}, but browser returned ${settings.deviceId}`);
+          }
+
           if (fallbackUsed) {
             setUsbContentionWarning(
               `USB Bandwidth adjusted: ${isIntraoral ? 'Intraoral camera' : 'Webcam'} stepped down to ${settings.width || 640}x${settings.height || 480} to prevent USB controller crash.`
@@ -208,8 +221,8 @@ export function useDeviceEnumeration() {
 
           return {
             stream,
-            actualWidth: settings.width || 1280,
-            actualHeight: settings.height || 720,
+            actualWidth: settings.width || (isIntraoral ? 1280 : 640),
+            actualHeight: settings.height || (isIntraoral ? 720 : 480),
             fallbackUsed,
           };
         } catch (err: unknown) {
@@ -220,11 +233,12 @@ export function useDeviceEnumeration() {
             err
           );
 
-          // If NotReadableError (USB bus saturation or device in use) or OverconstrainedError, try next step
+          // If NotReadableError (USB bus saturation or device in use) or OverconstrainedError, try next lower step
           if (
             errorName === 'NotReadableError' ||
             errorName === 'OverconstrainedError' ||
-            errorName === 'AbortError'
+            errorName === 'AbortError' ||
+            errorName === 'TrackStartError'
           ) {
             continue;
           }
