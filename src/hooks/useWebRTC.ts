@@ -74,6 +74,141 @@ export function useWebRTC({
   const streamMetadataRef = useRef<Map<string, VideoFeedType>>(new Map());
   const makingOfferRef = useRef<Map<string, boolean>>(new Map());
   const [iceConnectionState, setIceConnectionState] = useState<RTCIceConnectionState>('new');
+  const snapshotChunksRef = useRef<Map<string, { total: number; chunks: string[] }>>(new Map());
+
+  // Specification 3: Next-Gen Codec Forcing (AV1 > H.264 > VP9 > VP8)
+  const applyCodecPreferences = (pc: RTCPeerConnection) => {
+    if (typeof RTCRtpSender.getCapabilities === 'function') {
+      try {
+        const videoCaps = RTCRtpSender.getCapabilities('video');
+        if (videoCaps && videoCaps.codecs) {
+          const sortedCodecs = [...videoCaps.codecs].sort((a, b) => {
+            const score = (mime: string) => {
+              const m = mime.toLowerCase();
+              if (m.includes('av1')) return 1;
+              if (m.includes('h264')) return 2;
+              if (m.includes('vp9')) return 3;
+              if (m.includes('vp8')) return 4;
+              return 5;
+            };
+            return score(a.mimeType) - score(b.mimeType);
+          });
+          pc.getTransceivers().forEach((tc) => {
+            if (tc.sender.track?.kind === 'video' || tc.receiver.track?.kind === 'video') {
+              try {
+                tc.setCodecPreferences(sortedCodecs);
+              } catch {
+                // Ignore if not supported on this transceiver
+              }
+            }
+          });
+        }
+      } catch (e) {
+        console.warn('[WebRTC] setCodecPreferences fallback:', e);
+      }
+    }
+  };
+
+  // Specification 3 & 5: SDP Munging for Next-Gen Codecs & Opus FEC/RED
+  const mungSdpForCodecsAndAudio = (sdp: string): string => {
+    const lines = sdp.split('\r\n');
+    let inAudioSection = false;
+    let inVideoSection = false;
+    let opusPt: string | null = null;
+    const videoPtMap = new Map<string, string>();
+    let videoMLineIdx = -1;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.startsWith('m=audio')) {
+        inAudioSection = true;
+        inVideoSection = false;
+      } else if (line.startsWith('m=video')) {
+        inVideoSection = true;
+        inAudioSection = false;
+        videoMLineIdx = i;
+      } else if (line.startsWith('m=application')) {
+        inAudioSection = false;
+        inVideoSection = false;
+      }
+
+      // Find Opus payload type
+      if (inAudioSection && line.startsWith('a=rtpmap:')) {
+        const match = line.match(/^a=rtpmap:(\d+)\s+opus\/48000/i);
+        if (match) opusPt = match[1];
+      }
+
+      // Find video codec payload types
+      if (inVideoSection && line.startsWith('a=rtpmap:')) {
+        const match = line.match(/^a=rtpmap:(\d+)\s+([^/]+)/i);
+        if (match) {
+          videoPtMap.set(match[1], match[2].toLowerCase());
+        }
+      }
+
+      // Specification 5: Enforce Opus FEC (useinbandfec=1), DTX (usedtx=1), and max bitrate 32000
+      if (inAudioSection && opusPt && line.startsWith(`a=fmtp:${opusPt}`)) {
+        let fmtp = line;
+        if (!fmtp.includes('useinbandfec=1')) fmtp += ';useinbandfec=1';
+        if (!fmtp.includes('usedtx=1')) fmtp += ';usedtx=1';
+        if (!fmtp.includes('maxaveragebitrate=')) fmtp += ';maxaveragebitrate=32000';
+        lines[i] = fmtp;
+      }
+    }
+
+    // Specification 3: Reorder video m-line payload types so AV1 and H264 come first
+    if (videoMLineIdx >= 0 && videoPtMap.size > 0) {
+      const parts = lines[videoMLineIdx].split(' ');
+      if (parts.length > 3) {
+        const header = parts.slice(0, 3);
+        const pts = parts.slice(3);
+
+        const getCodecPriority = (pt: string) => {
+          const mime = videoPtMap.get(pt) || '';
+          if (mime.includes('av1')) return 1;
+          if (mime.includes('h264')) return 2;
+          if (mime.includes('vp9')) return 3;
+          if (mime.includes('vp8')) return 4;
+          return 10;
+        };
+
+        pts.sort((a, b) => getCodecPriority(a) - getCodecPriority(b));
+        lines[videoMLineIdx] = [...header, ...pts].join(' ');
+      }
+    }
+
+    return lines.join('\r\n');
+  };
+
+  // Specification 4: Chunked transmission of pristine raw hardware snapshot over RTCDataChannel
+  const sendSnapshotOverDataChannel = (payload: FreezeFramePayload) => {
+    try {
+      const jsonStr = JSON.stringify(payload);
+      const CHUNK_SIZE = 16384; // 16KB safe chunk size
+      const totalChunks = Math.ceil(jsonStr.length / CHUNK_SIZE);
+      const transferId = payload.id;
+
+      dataChannels.current.forEach((dc, peerId) => {
+        if (dc.readyState === 'open') {
+          for (let i = 0; i < totalChunks; i++) {
+            const chunkData = jsonStr.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+            dc.send(
+              JSON.stringify({
+                type: 'snapshot-chunk',
+                transferId,
+                index: i,
+                totalChunks,
+                data: chunkData,
+              })
+            );
+          }
+          console.log(`[WebRTC DataChannel] Sent uncompressed snapshot ${transferId} (${totalChunks} chunks) to ${peerId}`);
+        }
+      });
+    } catch (dcErr) {
+      console.warn('[WebRTC DataChannel] Snapshot broadcast error:', dcErr);
+    }
+  };
 
   // ICE Servers (Xirsys STUN/TURN servers for robust NAT/firewall traversal)
   const rtcConfigRef = useRef<RTCConfiguration>({
@@ -156,6 +291,7 @@ export function useWebRTC({
       peerRolesRef.current.delete(socketId);
       peerSendersRef.current.delete(socketId);
       makingOfferRef.current.delete(socketId);
+      dataChannels.current.delete(socketId);
       const existingAudioEl = document.getElementById(`audio-peer-${socketId}`);
       if (existingAudioEl) existingAudioEl.remove();
       setRemoteFeeds((prev) => {
@@ -291,6 +427,8 @@ export function useWebRTC({
             timestamp: Date.now(),
           };
 
+          // Dual transmission: WebRTC DataChannel (Specification 4) + Socket.io fallback
+          sendSnapshotOverDataChannel(payload);
           socket.emit('snapshot-captured', payload);
         }
       } catch (err) {
@@ -359,7 +497,7 @@ export function useWebRTC({
   const syncLocalTracksToPc = useCallback(
     (targetPeerId: string, pc: RTCPeerConnection) => {
       const targetRole = peerRolesRef.current.get(targetPeerId);
-      if (targetRole === 'mobile-cam') return; // Mobile is receive-only
+      if (targetRole === 'mobile-cam' || targetPeerId.startsWith('mobile')) return; // Mobile is receive-only
 
       if (!peerSendersRef.current.has(targetPeerId)) {
         peerSendersRef.current.set(targetPeerId, {});
@@ -397,6 +535,23 @@ export function useWebRTC({
                 console.warn('[WebRTC] Error adding intraoral track:', e);
               }
             }
+
+            // Specification 1: Force maintain-resolution (The "Slideshow" Method)
+            // Preserves crisp diagnostic resolution by letting framerate drop during network degradation
+            if (senders.intraoral) {
+              try {
+                const params = senders.intraoral.getParameters();
+                if (params) {
+                  params.degradationPreference = 'maintain-resolution';
+                  senders.intraoral.setParameters(params).catch((paramErr) => {
+                    console.warn('[WebRTC] Error setting maintain-resolution on intraoral sender:', paramErr);
+                  });
+                  console.log('[WebRTC] Applied degradationPreference = maintain-resolution on intraoral sender');
+                }
+              } catch (e) {
+                console.warn('[WebRTC] Could not set degradationPreference on intraoral sender:', e);
+              }
+            }
           }
         } else if (senders.intraoral && pcSenders.includes(senders.intraoral)) {
           // Camera disconnected/ended - replace with null to deactivate on remote peer
@@ -425,7 +580,7 @@ export function useWebRTC({
       // 4. Broadcast track metadata to target peer so receiver maps tracks deterministically
       const trackMeta = getLocalTrackMeta();
       if (trackMeta.length > 0 && socket) {
-        socket.emit('track-metadata', { targetPeerId, tracks: trackMeta });
+        socket.emit('track-metadata', { targetPeerId, tracks: trackMeta, senderRole: role });
       }
     },
     [role, audioStream, intraoralStream, webcamStream, socket, getLocalTrackMeta]
@@ -449,7 +604,7 @@ export function useWebRTC({
       peerConnections.current.set(targetPeerId, pc);
 
       const targetRole = peerRolesRef.current.get(targetPeerId);
-      const isMobile = targetRole === 'mobile-cam';
+      const isMobile = targetRole === 'mobile-cam' || targetPeerId.startsWith('mobile');
 
       if (!isMobile) {
         // Sync any currently available local tracks immediately
@@ -481,18 +636,27 @@ export function useWebRTC({
         }
       }
 
+      // Apply AV1/H.264 video codec preferences (Specification 3)
+      applyCodecPreferences(pc);
+
       // Setup W3C onnegotiationneeded handler
       pc.onnegotiationneeded = async () => {
         try {
           makingOfferRef.current.set(targetPeerId, true);
           if (!isMobile) syncLocalTracksToPc(targetPeerId, pc);
-          const offer = await pc.createOffer();
+          applyCodecPreferences(pc);
+          const rawOffer = await pc.createOffer();
           if (pc.signalingState !== 'stable') return;
+          const offer = new RTCSessionDescription({
+            type: rawOffer.type,
+            sdp: mungSdpForCodecsAndAudio(rawOffer.sdp || ''),
+          });
           await pc.setLocalDescription(offer);
           const trackMeta = isMobile ? [] : getLocalTrackMeta();
           socket?.emit('signal', {
             targetPeerId,
             signal: offer,
+            senderRole: role,
             trackMeta,
           });
           console.log(`[WebRTC] Sent renegotiation offer with ${trackMeta.length} track metadata to ${targetPeerId} (isMobile: ${isMobile})`);
@@ -527,6 +691,7 @@ export function useWebRTC({
           socket.emit('signal', {
             targetPeerId,
             signal: e.candidate,
+            senderRole: role,
           });
         }
       };
@@ -554,18 +719,20 @@ export function useWebRTC({
         }
 
         if (track.kind === 'video') {
+          const currentPeerRole = peerRolesRef.current.get(targetPeerId);
+          const isPeerMobile = isMobile || currentPeerRole === 'mobile-cam' || targetPeerId.startsWith('mobile');
+
           // Identify feedType deterministically via trackMetadataRef, streamMetadataRef, or isMobile
           let feedType: VideoFeedType | undefined =
-            isMobile
+            isPeerMobile
               ? 'mobile'
               : trackMetadataRef.current.get(track.id) ||
                 (incomingStream && streamMetadataRef.current.get(incomingStream.id));
 
           if (!feedType) {
-            const peerRole = peerRolesRef.current.get(targetPeerId);
-            if (peerRole === 'senior-doctor') {
+            if (currentPeerRole === 'senior-doctor') {
               feedType = 'senior-cam';
-            } else if (peerRole === 'mobile-cam') {
+            } else if (currentPeerRole === 'mobile-cam') {
               feedType = 'mobile';
             } else {
               // Junior dentist sends up to 2 video feeds: intraoral & webcam.
@@ -610,15 +777,35 @@ export function useWebRTC({
 
       return pc;
     },
-    [socket, syncLocalTracksToPc, getLocalTrackMeta, remoteFeeds]
+    [socket, syncLocalTracksToPc, getLocalTrackMeta, remoteFeeds, role]
   );
 
   const setupDataChannel = (dc: RTCDataChannel) => {
     dc.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
-        if (msg.type === 'stroke') onStrokeReceived?.(msg.stroke);
-        else if (msg.type === 'clear') onClearStrokes?.();
+        if (msg.type === 'stroke') {
+          onStrokeReceived?.(msg.stroke);
+        } else if (msg.type === 'clear') {
+          onClearStrokes?.();
+        } else if (msg.type === 'snapshot-chunk') {
+          // Reassemble chunked uncompressed hardware snapshot (Specification 4)
+          const { transferId, index, totalChunks, data } = msg;
+          if (!snapshotChunksRef.current.has(transferId)) {
+            snapshotChunksRef.current.set(transferId, { total: totalChunks, chunks: new Array(totalChunks) });
+          }
+          const item = snapshotChunksRef.current.get(transferId)!;
+          item.chunks[index] = data;
+
+          const receivedCount = item.chunks.filter(Boolean).length;
+          if (receivedCount === item.total) {
+            const fullJson = item.chunks.join('');
+            snapshotChunksRef.current.delete(transferId);
+            const payload: FreezeFramePayload = JSON.parse(fullJson);
+            console.log(`[WebRTC DataChannel] Reassembled complete raw hardware snapshot ${payload.id} (${item.total} chunks)`);
+            onSnapshotReceived?.(payload);
+          }
+        }
       } catch (err) {
         console.error('DataChannel parse error:', err);
       }
@@ -680,15 +867,22 @@ export function useWebRTC({
             }
             iceCandidatesQueue.current.delete(senderPeerId);
 
-            // Make sure our local tracks are attached before answering
-            syncLocalTracksToPc(senderPeerId, pc);
+            // Make sure our local tracks are attached before answering (never for mobile)
+            const isPeerMobile = senderRole === 'mobile-cam' || peerRolesRef.current.get(senderPeerId) === 'mobile-cam' || senderPeerId.startsWith('mobile');
+            if (!isPeerMobile) syncLocalTracksToPc(senderPeerId, pc);
+            applyCodecPreferences(pc);
 
-            const answer = await pc.createAnswer();
+            const rawAnswer = await pc.createAnswer();
+            const answer = new RTCSessionDescription({
+              type: rawAnswer.type,
+              sdp: mungSdpForCodecsAndAudio(rawAnswer.sdp || ''),
+            });
             await pc.setLocalDescription(answer);
-            const myTrackMeta = getLocalTrackMeta();
+            const myTrackMeta = isPeerMobile ? [] : getLocalTrackMeta();
             socket.emit('signal', {
               targetPeerId: senderPeerId,
               signal: answer,
+              senderRole: role,
               trackMeta: myTrackMeta,
             });
             console.log(`[WebRTC] Answered offer from ${senderPeerId} with ${myTrackMeta.length} track metadata`);
@@ -703,6 +897,34 @@ export function useWebRTC({
               }
               iceCandidatesQueue.current.delete(senderPeerId);
               console.log(`[WebRTC] Remote answer accepted from ${senderPeerId}`);
+
+              // Direct Mobile Stream Extraction:
+              // For transceivers added with addTransceiver('video', { direction: 'recvonly' }),
+              // ontrack does not fire in Chrome/Edge upon setRemoteDescription(answer).
+              // We directly extract the negotiated video receiver track!
+              const targetRole = peerRolesRef.current.get(senderPeerId) || senderRole;
+              if (targetRole === 'mobile-cam' || senderPeerId.startsWith('mobile')) {
+                const transceivers = pc.getTransceivers();
+                const videoTc = transceivers.find((t) => t.receiver.track?.kind === 'video');
+                const mobileTrack = videoTc?.receiver?.track;
+                if (mobileTrack) {
+                  const feedKey = `${senderPeerId}-mobile`;
+                  const finalStream = new MediaStream([mobileTrack]);
+                  setRemoteFeeds((prev) => {
+                    const next = new Map(prev);
+                    next.set(feedKey, { stream: finalStream, feedType: 'mobile', peerId: senderPeerId });
+                    return next;
+                  });
+                  console.log(`[WebRTC] Directly extracted mobile camera track for ${feedKey} (state: ${mobileTrack.readyState})`);
+                  mobileTrack.onended = () => {
+                    setRemoteFeeds((prev) => {
+                      const next = new Map(prev);
+                      next.delete(feedKey);
+                      return next;
+                    });
+                  };
+                }
+              }
             }
           }
         } else if ('candidate' in signal && signal.candidate) {
@@ -738,19 +960,26 @@ export function useWebRTC({
 
       if (!peerConnections.current.has(peer.socketId)) {
         // Designate initial offer initiator: junior clinic is primary host; senior doctor answers
-        const shouldInitiate = role === 'junior-dentist' || peer.role === 'mobile-cam' || ((socket.id || '') < peer.socketId);
+        const isMobile = peer.role === 'mobile-cam' || peer.socketId.startsWith('mobile');
+        const shouldInitiate = role === 'junior-dentist' || isMobile || ((socket.id || '') < peer.socketId);
         const pc = createPeerConnection(peer.socketId, shouldInitiate);
 
         if (shouldInitiate) {
           try {
             makingOfferRef.current.set(peer.socketId, true);
-            syncLocalTracksToPc(peer.socketId, pc);
-            const offer = await pc.createOffer();
+            if (!isMobile) syncLocalTracksToPc(peer.socketId, pc);
+            applyCodecPreferences(pc);
+            const rawOffer = await pc.createOffer();
+            const offer = new RTCSessionDescription({
+              type: rawOffer.type,
+              sdp: mungSdpForCodecsAndAudio(rawOffer.sdp || ''),
+            });
             await pc.setLocalDescription(offer);
-            const myTrackMeta = getLocalTrackMeta();
+            const myTrackMeta = isMobile ? [] : getLocalTrackMeta();
             socket.emit('signal', {
               targetPeerId: peer.socketId,
               signal: offer,
+              senderRole: role,
               trackMeta: myTrackMeta,
             });
             console.log(`[WebRTC] Sent initial offer with ${myTrackMeta.length} track metadata to peer ${peer.socketId} (${peer.role})`);
@@ -822,7 +1051,9 @@ export function useWebRTC({
               },
               timestamp: Date.now(),
             };
-            socket.emit('snapshot-captured', payload);
+            // Dual transmission: WebRTC DataChannel (Specification 4) + Socket.io fallback
+          sendSnapshotOverDataChannel(payload);
+          socket.emit('snapshot-captured', payload);
           }
         });
       }

@@ -102,6 +102,7 @@ export default function MobileCompanionPage() {
           socketRef.current.emit('signal', {
             targetPeerId,
             signal: e.candidate,
+            senderRole: 'mobile-cam',
             streamType: 'mobile',
           });
         }
@@ -296,6 +297,7 @@ export default function MobileCompanionPage() {
             s.emit('signal', {
               targetPeerId: senderPeerId,
               signal: answer,
+              senderRole: 'mobile-cam',
               streamType: 'mobile',
               trackMeta,
             });

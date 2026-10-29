@@ -268,10 +268,11 @@ app.prepare().then(async () => {
     });
 
     // WebRTC Signaling routing with in-band track metadata
-    socket.on('signal', ({ targetPeerId, signal, streamType, trackMeta }) => {
+    socket.on('signal', ({ targetPeerId, signal, streamType, trackMeta, senderRole }) => {
+      const effectiveRole = senderRole || currentUser?.role || 'senior-doctor';
       io.to(targetPeerId).emit('signal', {
         senderPeerId: socket.id,
-        senderRole: currentUser?.role || 'senior-doctor',
+        senderRole: effectiveRole,
         signal,
         streamType,
         trackMeta,
@@ -279,10 +280,11 @@ app.prepare().then(async () => {
     });
 
     // WebRTC Track Metadata routing (deterministic intraoral vs webcam identification)
-    socket.on('track-metadata', ({ targetPeerId, tracks }) => {
+    socket.on('track-metadata', ({ targetPeerId, tracks, senderRole }) => {
+      const effectiveRole = senderRole || currentUser?.role || 'senior-doctor';
       io.to(targetPeerId).emit('track-metadata', {
         senderPeerId: socket.id,
-        senderRole: currentUser?.role || 'senior-doctor',
+        senderRole: effectiveRole,
         tracks,
       });
     });

@@ -11,7 +11,7 @@ import {
   DentalBadge,
 } from '@/lib/webrtc-types';
 import { useWebRTC } from '@/hooks/useWebRTC';
-import { useDeviceEnumeration } from '@/hooks/useDeviceEnumeration';
+import { useDeviceEnumeration, stopMediaStream } from '@/hooks/useDeviceEnumeration';
 import { useBandwidthMonitor } from '@/hooks/useBandwidthMonitor';
 import { SessionHeader } from '@/components/communication/SessionHeader';
 import { LowBandwidthBanner } from '@/components/clinical/LowBandwidthBanner';
@@ -178,13 +178,18 @@ export default function ClinicalRoomPage() {
     intraoralStream,
   });
 
+  // Active stream references for clean hardware teardown to prevent Windows UVC exclusive locks
+  const activeIntraoralRef = React.useRef<MediaStream | null>(null);
+  const activeWebcamRef = React.useRef<MediaStream | null>(null);
+  const activeAudioRef = React.useRef<MediaStream | null>(null);
+
   // Acquire local media streams on component mount
   useEffect(() => {
     let isMounted = true;
 
     async function initHardware() {
+      // 1. Audio stream with acoustic echo cancellation (Isolated try/catch so mic failure NEVER aborts camera init!)
       try {
-        // 1. Audio stream with acoustic echo cancellation
         const audio = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
@@ -193,65 +198,119 @@ export default function ClinicalRoomPage() {
           },
           video: false,
         });
-        if (isMounted) setAudioStream(audio);
+        if (isMounted) {
+          activeAudioRef.current = audio;
+          setAudioStream(audio);
+        }
+      } catch (audioErr) {
+        console.warn('[Hardware] Audio input unavailable or not plugged in (non-fatal, continuing to cameras):', audioErr);
+      }
 
-        if (role === 'junior-dentist') {
-          // 2. Junior PC: Ingest USB Intraoral camera and webcam
-          if (selectedIntraoralId) {
-            try {
-              const intraResult = await acquireCameraWithFallback(selectedIntraoralId, true);
-              const track = intraResult.stream.getVideoTracks()[0];
-              if (track) {
-                track.onended = () => {
-                  console.warn('[Hardware] USB Intraoral camera unplugged/ended');
-                  setIntraoralStream(null);
-                };
-              }
-              if (isMounted) setIntraoralStream(intraResult.stream);
-            } catch (err) {
-              console.warn('Could not acquire selected intraoral camera:', err);
-              setIntraoralStream(null);
-            }
-          }
+      if (role === 'junior-dentist') {
+        // 2. Junior PC: Ingest USB Intraoral camera and webcam with collision protection & Windows UVC lock release
+        let targetIntraId = selectedIntraoralId;
+        let targetWebId = selectedWebcamId;
 
-          if (selectedWebcamId) {
-            try {
-              const webResult = await acquireCameraWithFallback(selectedWebcamId, false);
-              const track = webResult.stream.getVideoTracks()[0];
-              if (track) {
-                track.onended = () => {
-                  console.warn('[Hardware] Clinician webcam unplugged/ended');
-                  setWebcamStream(null);
-                };
-              }
-              if (isMounted) setWebcamStream(webResult.stream);
-            } catch (err) {
-              console.warn('Could not acquire selected webcam:', err);
-              setWebcamStream(null);
-            }
-          }
-        } else {
-          // 3. Senior Doctor: Standard webcam stream
-          try {
-            const docCam = await navigator.mediaDevices.getUserMedia({
-              video: { width: 1280, height: 720 },
-              audio: false,
-            });
-            const track = docCam.getVideoTracks()[0];
-            if (track) {
-              track.onended = () => {
-                console.warn('[Hardware] Senior doctor camera unplugged/ended');
-                setWebcamStream(null);
-              };
-            }
-            if (isMounted) setWebcamStream(docCam);
-          } catch (err) {
-            console.warn('Senior doctor camera unavailable:', err);
-            setWebcamStream(null);
+        // Auto-assign fallback if both slots point to the same device ID
+        if (targetIntraId && targetWebId && targetIntraId === targetWebId && videoDevices.length > 1) {
+          const alternate = videoDevices.find((d) => d.deviceId !== targetIntraId);
+          if (alternate) {
+            targetWebId = alternate.deviceId;
+            console.log(`[Hardware] Resolved camera collision: assigned webcam to alternate ${alternate.label}`);
           }
         }
-      } catch (err) {
-        console.error('Initial hardware acquisition error:', err);
+
+        // Ingest USB Intraoral camera
+        if (targetIntraId) {
+          try {
+            // Cleanly stop any existing intraoral track to release Windows UVC lock
+            if (activeIntraoralRef.current) {
+              stopMediaStream(activeIntraoralRef.current);
+              activeIntraoralRef.current = null;
+            }
+
+            const intraResult = await acquireCameraWithFallback(targetIntraId, true);
+            const track = intraResult.stream.getVideoTracks()[0];
+            if (track) {
+              track.onended = () => {
+                console.warn('[Hardware] USB Intraoral camera unplugged/ended');
+                setIntraoralStream(null);
+                activeIntraoralRef.current = null;
+              };
+            }
+            if (isMounted) {
+              activeIntraoralRef.current = intraResult.stream;
+              setIntraoralStream(intraResult.stream);
+            } else {
+              stopMediaStream(intraResult.stream);
+            }
+          } catch (err) {
+            console.warn('[Hardware] Could not acquire selected intraoral camera:', err);
+            if (isMounted) setIntraoralStream(null);
+          }
+        }
+
+        // Ingest Clinician webcam
+        if (targetWebId) {
+          try {
+            // Cleanly stop any existing webcam track to release Windows UVC lock
+            if (activeWebcamRef.current) {
+              stopMediaStream(activeWebcamRef.current);
+              activeWebcamRef.current = null;
+            }
+
+            const webResult = await acquireCameraWithFallback(targetWebId, false);
+            const track = webResult.stream.getVideoTracks()[0];
+            if (track) {
+              track.onended = () => {
+                console.warn('[Hardware] Clinician webcam unplugged/ended');
+                setWebcamStream(null);
+                activeWebcamRef.current = null;
+              };
+            }
+            if (isMounted) {
+              activeWebcamRef.current = webResult.stream;
+              setWebcamStream(webResult.stream);
+            } else {
+              stopMediaStream(webResult.stream);
+            }
+          } catch (err) {
+            console.warn('[Hardware] Could not acquire selected webcam:', err);
+            if (isMounted) setWebcamStream(null);
+          }
+        }
+      } else {
+        // 3. Senior Doctor: Standard webcam stream
+        try {
+          if (activeWebcamRef.current) {
+            stopMediaStream(activeWebcamRef.current);
+            activeWebcamRef.current = null;
+          }
+
+          const targetDocId = selectedWebcamId || (videoDevices[0]?.deviceId ?? undefined);
+          const docConstraints: MediaStreamConstraints = targetDocId
+            ? { video: { deviceId: { ideal: targetDocId }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false }
+            : { video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false };
+
+          const docCam = await navigator.mediaDevices.getUserMedia(docConstraints);
+          const track = docCam.getVideoTracks()[0];
+          if (track) {
+            track.onended = () => {
+              console.warn('[Hardware] Senior doctor camera unplugged/ended');
+              setWebcamStream(null);
+              activeWebcamRef.current = null;
+            };
+          }
+          if (isMounted) {
+            activeWebcamRef.current = docCam;
+            setWebcamStream(docCam);
+          } else {
+            stopMediaStream(docCam);
+          }
+        } catch (err) {
+          console.warn('[Hardware] Senior doctor camera unavailable:', err);
+          if (isMounted) setWebcamStream(null);
+        }
       }
     }
 
@@ -260,7 +319,7 @@ export default function ClinicalRoomPage() {
     return () => {
       isMounted = false;
     };
-  }, [role, selectedIntraoralId, selectedWebcamId, videoDevices, acquireCameraWithFallback, setAudioStream, setIntraoralStream, setWebcamStream]);
+  }, [role, selectedIntraoralId, selectedWebcamId, acquireCameraWithFallback, setAudioStream, setIntraoralStream, setWebcamStream]);
 
   // Route incoming remote feeds to proper video slots
   let remoteIntraoral: MediaStream | null = null;
@@ -281,7 +340,10 @@ export default function ClinicalRoomPage() {
   const activeSenior = role === 'senior-doctor' ? webcamStream : remoteSenior;
 
   const handleLeaveCall = () => {
-    // Stop local tracks
+    // Cleanly stop local hardware tracks to release Windows UVC lock
+    stopMediaStream(activeWebcamRef.current);
+    stopMediaStream(activeIntraoralRef.current);
+    stopMediaStream(activeAudioRef.current);
     webcamStream?.getTracks().forEach((t) => t.stop());
     intraoralStream?.getTracks().forEach((t) => t.stop());
     audioStream?.getTracks().forEach((t) => t.stop());

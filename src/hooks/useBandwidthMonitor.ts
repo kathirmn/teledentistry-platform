@@ -36,11 +36,13 @@ export function useBandwidthMonitor({
 
   // Apply frame rate and constraints degradation to local streams
   const applyTierToTracks = useCallback((tier: LowBandwidthTier) => {
-    // Intraoral Camera: Always prioritize sharp resolution, reducing FPS rather than detail
+    const isCritical = tier === 'critical';
+
+    // Intraoral Camera: Always prioritize sharp resolution, reducing FPS rather than detail (Specification 1)
     if (intraoralStream) {
       const track = intraoralStream.getVideoTracks()[0];
       if (track && track.readyState === 'live') {
-        const targetFps = tier === 'critical' ? 10 : tier === 'moderate' ? 15 : 25;
+        const targetFps = isCritical ? 10 : tier === 'moderate' ? 15 : 25;
         try {
           track.applyConstraints({ frameRate: { ideal: targetFps, max: targetFps } }).catch(() => {});
         } catch (e) {
@@ -49,23 +51,33 @@ export function useBandwidthMonitor({
       }
     }
 
-    // PC Webcam: Can aggressively drop resolution and fps in low bandwidth to preserve intraoral
+    // Specification 2: Aggressive Asymmetric Bandwidth Throttling
+    // When available uplink drops to critical (< 800 Kbps), programmatically set track.enabled = false
+    // for secondary feeds ("Clinician / Face Webcam"), reallocating 100% bandwidth to intraoral camera and clinical audio.
     if (webcamStream) {
       const track = webcamStream.getVideoTracks()[0];
       if (track && track.readyState === 'live') {
-        const targetFps = tier === 'critical' ? 5 : tier === 'moderate' ? 15 : 20;
-        const targetWidth = tier === 'critical' ? 320 : tier === 'moderate' ? 640 : 1280;
-        const targetHeight = tier === 'critical' ? 240 : tier === 'moderate' ? 480 : 720;
-        try {
-          track
-            .applyConstraints({
-              width: { ideal: targetWidth, max: targetWidth },
-              height: { ideal: targetHeight, max: targetHeight },
-              frameRate: { ideal: targetFps, max: targetFps },
-            })
-            .catch(() => {});
-        } catch (e) {
-          console.warn('Could not apply webcam constraints', e);
+        if (isCritical) {
+          // Throttled: mute track so WebRTC stops transmitting video packets completely
+          track.enabled = false;
+          console.log('[Bandwidth Monitor] Critical uplink (<800Kbps): Asymmetrically throttled clinician webcam (track.enabled = false)');
+        } else {
+          // Restored: re-enable track and scale constraints based on network tier
+          track.enabled = true;
+          const targetFps = tier === 'moderate' ? 15 : 20;
+          const targetWidth = tier === 'moderate' ? 640 : 1280;
+          const targetHeight = tier === 'moderate' ? 480 : 720;
+          try {
+            track
+              .applyConstraints({
+                width: { ideal: targetWidth, max: targetWidth },
+                height: { ideal: targetHeight, max: targetHeight },
+                frameRate: { ideal: targetFps, max: targetFps },
+              })
+              .catch(() => {});
+          } catch (e) {
+            console.warn('Could not apply webcam constraints', e);
+          }
         }
       }
     }

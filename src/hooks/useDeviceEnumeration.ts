@@ -8,6 +8,22 @@ export interface MediaDeviceInfoSummary {
   kind: MediaDeviceKind;
 }
 
+export function stopMediaStream(stream: MediaStream | null | undefined) {
+  if (!stream) return;
+  try {
+    stream.getTracks().forEach((track) => {
+      try {
+        track.stop();
+        console.log(`[Hardware] Stopped track: ${track.kind} (${track.label})`);
+      } catch (err) {
+        console.warn('[Hardware] Error stopping track:', err);
+      }
+    });
+  } catch (e) {
+    console.warn('[Hardware] Error stopping stream tracks:', e);
+  }
+}
+
 export interface CameraStreamResult {
   stream: MediaStream;
   actualWidth: number;
@@ -64,13 +80,15 @@ export function useDeviceEnumeration() {
         const candidateIntra = vDevices.find((d) => intraKeywords.test(d.label));
         const candidateWebcam = vDevices.find((d) => webcamKeywords.test(d.label));
 
-        if (candidateIntra && candidateWebcam) {
+        if (candidateIntra && candidateWebcam && candidateIntra.deviceId !== candidateWebcam.deviceId) {
           setSelectedIntraoralId((prev) => prev || candidateIntra.deviceId);
           setSelectedWebcamId((prev) => prev || candidateWebcam.deviceId);
         } else {
-          // Fallback: first camera as webcam, second as intraoral
-          setSelectedWebcamId((prev) => prev || vDevices[0].deviceId);
-          setSelectedIntraoralId((prev) => prev || vDevices[1].deviceId);
+          // Fallback: first camera as webcam, second as intraoral (guaranteed distinct)
+          const first = vDevices[0]?.deviceId || '';
+          const second = vDevices[1]?.deviceId || '';
+          setSelectedWebcamId((prev) => prev || first);
+          setSelectedIntraoralId((prev) => prev || (second !== first ? second : ''));
         }
       }
       if (aDevices.length > 0) {
@@ -96,33 +114,49 @@ export function useDeviceEnumeration() {
   }, [refreshDevices]);
 
   /**
-   * Acquire camera stream with an automatic fallback ladder to solve USB 2.0 Root Hub Contention:
-   * Try 1080p -> fallback 720p @ 15fps -> fallback 480p @ 15fps with MJPEG preference
+   * Acquire camera stream with an automatic fallback ladder to solve USB 2.0/3.0 Root Hub Contention
+   * and Windows UVC driver constraints.
+   * Tries:
+   * 1. Exact deviceId at 1080p (intraoral) or 720p (webcam)
+   * 2. Ideal deviceId at 720p @ 15fps
+   * 3. Ideal deviceId at 640x480 @ 15fps (safe universal resolution)
+   * 4. Relaxed deviceId constraints (uncompressed/MJPEG fallback)
    */
   const acquireCameraWithFallback = useCallback(
     async (deviceId: string, isIntraoral = false): Promise<CameraStreamResult> => {
       setUsbContentionWarning(null);
 
-      // Resolution ladder
+      if (!deviceId) {
+        throw new Error('No device ID specified for camera acquisition');
+      }
+
+      // Resolution ladder with exact device ID first, then ideal device ID
       const constraintLadder: MediaTrackConstraints[] = isIntraoral
         ? [
-            // Ladder 1: High definition for intraoral inspection
+            // Ladder 1: High definition for intraoral inspection (exact device)
             {
               deviceId: { exact: deviceId },
               width: { ideal: 1920 },
               height: { ideal: 1080 },
               frameRate: { ideal: 20 },
             },
-            // Ladder 2: Safe 720p if 1080p saturated USB bus
+            // Ladder 2: Exact device at 720p (saves USB bus endpoints)
             {
               deviceId: { exact: deviceId },
               width: { ideal: 1280 },
               height: { ideal: 720 },
               frameRate: { ideal: 15 },
             },
-            // Ladder 3: 480p emergency fallback
+            // Ladder 3: Ideal device at 720p (handles Windows UVC deviceId hash mismatch)
             {
-              deviceId: { exact: deviceId },
+              deviceId: { ideal: deviceId },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 15 },
+            },
+            // Ladder 4: 480p universal fallback
+            {
+              deviceId: { ideal: deviceId },
               width: { ideal: 640 },
               height: { ideal: 480 },
               frameRate: { ideal: 15 },
@@ -137,7 +171,13 @@ export function useDeviceEnumeration() {
               frameRate: { ideal: 15 },
             },
             {
-              deviceId: { exact: deviceId },
+              deviceId: { ideal: deviceId },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 15 },
+            },
+            {
+              deviceId: { ideal: deviceId },
               width: { ideal: 640 },
               height: { ideal: 480 },
               frameRate: { ideal: 15 },
@@ -160,9 +200,11 @@ export function useDeviceEnumeration() {
 
           if (fallbackUsed) {
             setUsbContentionWarning(
-              `USB Bandwidth adjusted: ${isIntraoral ? 'Intraoral camera' : 'Webcam'} stepped down to ${settings.width}x${settings.height} to prevent USB controller crash.`
+              `USB Bandwidth adjusted: ${isIntraoral ? 'Intraoral camera' : 'Webcam'} stepped down to ${settings.width || 640}x${settings.height || 480} to prevent USB controller crash.`
             );
           }
+
+          console.log(`[Hardware] Successfully acquired ${isIntraoral ? 'intraoral' : 'webcam'} camera on step ${i + 1} (${settings.width}x${settings.height})`);
 
           return {
             stream,
@@ -174,12 +216,16 @@ export function useDeviceEnumeration() {
           lastError = err;
           const errorName = (err as Error)?.name;
           console.warn(
-            `Ladder step ${i + 1} failed for camera (${errorName}):`,
+            `Ladder step ${i + 1} failed for ${isIntraoral ? 'intraoral' : 'webcam'} camera (${errorName}):`,
             err
           );
 
-          // If NotReadableError (USB bus saturation), immediately continue to next lower step
-          if (errorName === 'NotReadableError' || errorName === 'OverconstrainedError') {
+          // If NotReadableError (USB bus saturation or device in use) or OverconstrainedError, try next step
+          if (
+            errorName === 'NotReadableError' ||
+            errorName === 'OverconstrainedError' ||
+            errorName === 'AbortError'
+          ) {
             continue;
           }
         }
